@@ -1,0 +1,6 @@
+Data/login.txt
+Data/login2.txt
+Data/*.csv
+Data/datasets/*
+Data/ZipFiles/*
+Models/model_saves/*
