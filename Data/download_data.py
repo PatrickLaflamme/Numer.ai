@@ -4,25 +4,15 @@ import subprocess as sp
 from numerapi import NumerAPI
 
 def downloadNumeraiData():
-    
-    # load the login file
-    with open(login_file) as f:
-        content = f.readlines()
-
-    # strip the newline characters and any whitespace
-    content = [x.strip() for x in content] 
 
     # set up paths for download of dataset and upload of predictions
-    now = datetime.now().strftime("%Y%m%d")
     dataset_parent_folder = "./datasets/"
-    dataset_name = "numerai_dataset_{0}/example_predictions.csv".format(now)
-    dataset_path = "{0}/{1}".format(dataset_parent_folder, dataset_name)
     
-    # most API calls do not require logging in
+    # We don't need to login in order to download the dataset
     napi = NumerAPI(verbosity="info")
 
     # download current dataset
-    dl_succeeded = napi.download_current_dataset(dest_path=dataset_parent_folder,unzip=True)
+    napi.download_current_dataset(dest_path=dataset_parent_folder,unzip=True)
     
     sp.call("mv " + dataset_parent_folder + "/*.zip ZipFiles/", shell=True)
     sp.call("rm " + dataset_parent_folder + "/*/example*")
