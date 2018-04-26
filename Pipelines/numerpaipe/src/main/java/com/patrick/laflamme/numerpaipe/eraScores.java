@@ -2,7 +2,9 @@ package com.patrick.laflamme.numerpaipe;
 
 import java.util.HashMap;
 import java.util.Map;
+
 import com.patrick.laflamme.numerpaipe.utils.WriteToText;
+
 import org.apache.avro.reflect.Nullable;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.AvroCoder;
@@ -17,20 +19,27 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.join.CoGroupByKey;
+import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
+import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple.TaggedKeyedPCollection;
+import org.apache.beam.sdk.transforms.join.CoGbkResult;
 import org.apache.beam.sdk.transforms.Mean;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.Sum;
+import org.apache.beam.sdk.transforms.DoFn.ProcessElement;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
+import org.apache.beam.sdk.values.TupleTag;
+import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class epochScores {
+public class eraScores {
     
     /**
-   * Class to hold info about a game event.
+   * Class to hold info about a trade event.
    */
   @DefaultCoder(AvroCoder.class)
   static class tradeInfo {
@@ -59,8 +68,11 @@ public class epochScores {
     public String getDataType() {
       return this.data_type;
     }
-    public Double[] getFeature(int index) {
+    public Double getFeature(int index) {
       return this.features[index];
+    }
+    public Double[] getAllFeatures() {
+      return this.features;
     }
     public Integer getTarget() {
       return this.target;
@@ -116,37 +128,67 @@ public class epochScores {
       }
     }
 
-    protected static Map<String, WriteToText.FieldFn<KV<String, Integer>>>
-        configureOutput() {
-      Map<String, WriteToText.FieldFn<KV<String, Integer>>> config = new HashMap<>();
-      config.put("era", (c, w) -> c.element().getKey());
-      config.put("mean_factor_score", (c, w) -> c.element().getValue());
-      return config;
+  public static class ExtractAndMeanScore
+      extends PTransform<PCollection<tradeInfo>, PCollection<KV<String, Double>>> {
+
+    private final String field;
+    private final Integer featureID;
+
+    ExtractAndMeanScore(String field, Integer featureID) {
+      this.field = field;
+      this.featureID = featureID;
     }
 
-    public static class ExtractAndMeanScore
-        extends PTransform<PCollection<tradeInfo>, PCollection<KV<String, Double>>> {
+    @Override
+    public PCollection<KV<String, Double>> expand(
+        PCollection<tradeInfo> tradeMakeInfo) {
 
-      private final String field;
-      private final Integer featureID;
-
-      ExtractAndMeanScore(String field, Integer featureID) {
-        this.field = field;
-        this.featureID = featureID;
-      }
-
-      @Override
-      public PCollection<KV<String, Integer>> expand(
-          PCollection<tradeInfo> tradeMakeInfo) {
-
-        return tradeMakeInfo
-            .apply(
-                MapElements.into(
-                        TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptors.doubles()))
-                    .via((tradeInfo tInfo) -> KV.of(tInfo.getKey(field), tInfo.getFeature(featureID))))
-            .apply(Mean.perKey());
-      }
+      return tradeMakeInfo
+          .apply(
+              MapElements.into(
+                      TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptors.doubles()))
+                  .via((tradeInfo tInfo) -> KV.of(tInfo.getKey(field), tInfo.getFeature(featureID))))
+          .apply(Mean.perKey());
     }
+  }
+
+  static class meanFeatures extends PTransform<PCollection<tradeInfo>, PCollection<KV<String,Double[]>>>{
+
+    private final String field;
+
+    meanFeatures(String field) {
+      this.field = field;
+    }
+
+    @Override
+    public PCollection<KV<String, Double[]>> expand(
+      PCollection<tradeInfo> tradeMakeInfo) {
+
+      Integer nFeatures = 50;
+      TupleTag<String> featureTag = new TupleTag<String>();
+      
+      PCollection<KV<String, Double>> feature;
+
+      PCollectionList<KV<String, Double>> pcs;
+
+      for(int i = 0; i < nFeatures; i++){
+        feature = tradeMakeInfo.apply(new ExtractAndMeanScore(field, i));
+        TaggedKeyedPCollection<String, PCollection<KV<String, Double>>> features = KeyedPCollectionTuple.of(featureTag, feature);
+        features = features.and(featureTag, feature);
+      }
+
+      return features.apply(CoGroupByKey.create());
+    }
+  }
+
+
+  protected static Map<String, WriteToText.FieldFn<KV<String, Double[]>>>
+      configureOutput() {
+    Map<String, WriteToText.FieldFn<KV<String, Double[]>>> config = new HashMap<>();
+    config.put("era", (c, w) -> c.element().getKey());
+    config.put("mean_factor_scores", (c, w) -> c.element().getValue());
+    return config;
+  }
 
     public interface Options extends PipelineOptions {
 
@@ -166,15 +208,12 @@ public class epochScores {
     // Begin constructing a pipeline configured by commandline flags.
     Options options = PipelineOptionsFactory.fromArgs(args).withValidation().as(Options.class);
     Pipeline pipeline = Pipeline.create(options);
-
+    
     // Read events from a text file and parse them.
-    pipeline
-        .apply(TextIO.read().from(options.getInput()))
-        .apply("ParseTradeEvent", ParDo.of(new ParseTradeFn()))
-        // Extract and sum username/score pairs from the event data.
-        .apply("ExtractEraMeans", new ExtractAndMeanScore("era",1))
-        .apply(
-            "WriteEraMeans", new WriteToText<>(options.getOutput(), configureOutput(), false));
+    pipeline.apply(TextIO.read().from(options.getInput()))
+            .apply("ParseTradeEvent", ParDo.of(new ParseTradeFn()))
+            .apply("ExtractEraMeans", new meanFeatures("era"))
+            .apply("WriteEraMeans", new WriteToText<>(options.getOutput(), configureOutput(), false));
 
     // Run the batch pipeline.
     pipeline.run().waitUntilFinish();

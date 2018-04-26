@@ -5,3 +5,4 @@ Data/datasets/*
 Data/ZipFiles/*
 Models/model_saves/*
 Pipelines/*/target
+.vscode/
