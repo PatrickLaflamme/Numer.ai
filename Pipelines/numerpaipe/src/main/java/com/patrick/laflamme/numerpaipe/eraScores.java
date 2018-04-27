@@ -1,5 +1,7 @@
 package com.patrick.laflamme.numerpaipe;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -152,11 +154,11 @@ public class eraScores {
     }
   }
 
-  static class meanFeatures extends PTransform<PCollection<tradeInfo>, PCollection<KV<String,Double[]>>>{
+  static class MeanFeatures extends PTransform<PCollection<tradeInfo>, PCollection<KV<String,Double[]>>>{
 
     private final String field;
 
-    meanFeatures(String field) {
+    MeanFeatures(String field) {
       this.field = field;
     }
 
@@ -165,22 +167,79 @@ public class eraScores {
       PCollection<tradeInfo> tradeMakeInfo) {
 
       Integer nFeatures = 50;
-      TupleTag<String> featureTag = new TupleTag<String>();
       
       PCollection<KV<String, Double>> feature;
+      Pipeline pipe = tradeMakeInfo.getPipeline();
+      KeyedPCollectionTuple<String> features = KeyedPCollectionTuple.empty(pipe);
+      List<TupleTag<Double>> tags = new ArrayList<TupleTag<Double>>(0);
 
       PCollectionList<KV<String, Double>> pcs;
 
       for(int i = 0; i < nFeatures; i++){
+        TupleTag<Double> currentTag = new TupleTag<Double>(Integer.toString(i));
+        tags.add(currentTag);
+
         feature = tradeMakeInfo.apply(new ExtractAndMeanScore(field, i));
-        TaggedKeyedPCollection<String, PCollection<KV<String, Double>>> features = KeyedPCollectionTuple.of(featureTag, feature);
-        features = features.and(featureTag, feature);
+        features = features.and(currentTag, feature);
       }
 
-      return features.apply(CoGroupByKey.create());
+      PCollection<KV<String, CoGbkResult>> keyValues = features.apply(CoGroupByKey.create());
+
+      return keyValues.apply(ParDo.of(new FlattenCoGbkResult(tags)));
+    }
+
+  }
+
+
+  static class FlattenCoGbkResult extends DoFn<KV<String, CoGbkResult>, KV<String, Double[]>>{
+    
+    private final List<TupleTag<Double>> tags;
+
+    FlattenCoGbkResult(List<TupleTag<Double>> tags){
+      this.tags = tags;
+    }
+
+    @ProcessElement
+    public void processElement(ProcessContext c) {
+      
+      KV<String, CoGbkResult> e = c.element();
+
+      Integer nFeatures = tags.size();
+
+      Double[] featureArray = new Double[nFeatures];
+
+      for(int i = 0; i < nFeatures; i++){
+
+        TupleTag<Double> tag = tags.get(i);
+        Double feature = e.getValue().getOnly(tag);
+
+        featureArray[i] = feature;
+      }
+      String key = e.getKey();
+
+      c.output(KV.of(key, featureArray));
     }
   }
 
+  static class StringifyGroups extends DoFn<KV<String, Double[]>, String> {
+
+    @ProcessElement
+    public void processElement(ProcessContext c) {
+
+      String groupID = c.element().getKey();
+      Double[] features = c.element().getValue();
+      Integer nFeatures = features.length;
+      List<String> outputList = new ArrayList<String>(51);
+
+      outputList.add(0, groupID);
+
+      for(int i = 1; i <= nFeatures; i++){
+        outputList.add(i, Double.toString(features[i-1]));
+      }
+
+      c.output(String.join(",", outputList));
+    }
+  }
 
   protected static Map<String, WriteToText.FieldFn<KV<String, Double[]>>>
       configureOutput() {
@@ -190,19 +249,19 @@ public class eraScores {
     return config;
   }
 
-    public interface Options extends PipelineOptions {
+  public interface Options extends PipelineOptions {
 
-      @Description("Path to the data file(s) containing numer.ai data.")
-      @Default.String("file://home/patricklaflamme/Desktop/numer.ai/Data/datasets/*/*_data.csv")
-      String getInput();
-      void setInput(String value);
+    @Description("Path to the data file(s) containing numer.ai data.")
+    @Default.String("file://home/patricklaflamme/Desktop/numer.ai/Data/datasets/numerai_dataset_104/*_data.csv")
+    String getInput();
+    void setInput(String value);
 
-      // Set this required option to specify where to write the output.
-      @Description("Path of the file to write to.")
-      @Validation.Required
-      String getOutput();
-      void setOutput(String value);
-    }
+    // Set this required option to specify where to write the output.
+    @Description("Path of the file to write to.")
+    @Validation.Required
+    String getOutput();
+    void setOutput(String value);
+  }
 
   public static void main(String [] args) throws Exception{
     // Begin constructing a pipeline configured by commandline flags.
@@ -212,8 +271,9 @@ public class eraScores {
     // Read events from a text file and parse them.
     pipeline.apply(TextIO.read().from(options.getInput()))
             .apply("ParseTradeEvent", ParDo.of(new ParseTradeFn()))
-            .apply("ExtractEraMeans", new meanFeatures("era"))
-            .apply("WriteEraMeans", new WriteToText<>(options.getOutput(), configureOutput(), false));
+            .apply("ExtractEraMeans", new MeanFeatures("era"))
+            .apply("StringifyEraMeans", ParDo.of(new StringifyGroups()))
+            .apply("WriteEraMeans", TextIO.write().to(options.getOutput()));
 
     // Run the batch pipeline.
     pipeline.run().waitUntilFinish();
